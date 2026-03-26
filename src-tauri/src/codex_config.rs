@@ -1,4 +1,5 @@
 // unused imports removed
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use crate::config::{
@@ -6,6 +7,7 @@ use crate::config::{
     write_text_file,
 };
 use crate::error::AppError;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -250,6 +252,153 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
     doc.to_string()
 }
 
+/// 获取 Codex session_index.jsonl 路径
+pub fn get_codex_session_index_path() -> PathBuf {
+    get_codex_config_dir().join("session_index.jsonl")
+}
+
+/// 获取 Codex state_5.sqlite 路径
+pub fn get_codex_state_db_path() -> PathBuf {
+    get_codex_config_dir().join("state_5.sqlite")
+}
+
+fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), AppError> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(root).map_err(|e| AppError::io(root, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::io(root, e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+/// 统一 Codex 历史 rollout 首行里的 model_provider 到当前活动 provider
+pub fn sync_codex_rollout_model_provider(provider_id: &str) -> Result<usize, AppError> {
+    let root = get_codex_config_dir();
+    let mut files = Vec::new();
+    collect_rollout_files(&root.join("sessions"), &mut files)?;
+    collect_rollout_files(&root.join("archived_sessions"), &mut files)?;
+
+    let mut changed = 0usize;
+
+    for path in files {
+        let file = std::fs::File::open(&path).map_err(|e| AppError::io(&path, e))?;
+        let mut lines: Vec<String> = BufReader::new(file)
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::io(&path, e))?;
+
+        if lines.is_empty() {
+            continue;
+        }
+
+        let mut first: Value = match serde_json::from_str(&lines[0]) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if first.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+
+        let Some(payload) = first.get_mut("payload").and_then(Value::as_object_mut) else {
+            continue;
+        };
+
+        let current = payload
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if current == provider_id {
+            continue;
+        }
+
+        payload.insert(
+            "model_provider".to_string(),
+            Value::String(provider_id.to_string()),
+        );
+        lines[0] =
+            serde_json::to_string(&first).map_err(|e| AppError::JsonSerialize { source: e })?;
+        write_text_file(&path, &(lines.join("\n") + "\n"))?;
+        changed += 1;
+    }
+
+    Ok(changed)
+}
+
+/// 将 Codex state_5.sqlite 中的 threads.model_provider 统一到当前活动 provider
+pub fn sync_codex_threads_model_provider(provider_id: &str) -> Result<usize, AppError> {
+    let path = get_codex_state_db_path();
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(&path).map_err(|e| AppError::Database(e.to_string()))?;
+    let changed = conn
+        .execute(
+            "UPDATE threads SET model_provider = ?1 WHERE model_provider IS NULL OR model_provider != ?1",
+            [provider_id],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(changed)
+}
+
+/// 从 state_5.sqlite 的 threads 表重建 session_index.jsonl
+pub fn rebuild_codex_session_index() -> Result<usize, AppError> {
+    let db_path = get_codex_state_db_path();
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(&db_path).map_err(|e| AppError::Database(e.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(title, first_user_message, 'New Session') AS thread_name, \
+             strftime('%Y-%m-%dT%H:%M:%S.000Z', updated_at, 'unixepoch') AS updated_at \
+             FROM threads ORDER BY updated_at ASC",
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let thread_name: String = row.get(1)?;
+            let updated_at: String = row.get(2)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "thread_name": thread_name,
+                "updated_at": updated_at,
+            }))
+        })
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut lines = Vec::new();
+    for row in rows {
+        let value = row.map_err(|e| AppError::Database(e.to_string()))?;
+        lines.push(
+            serde_json::to_string(&value).map_err(|e| AppError::JsonSerialize { source: e })?,
+        );
+    }
+
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
+    let index_path = get_codex_session_index_path();
+    write_text_file(&index_path, &content)?;
+    Ok(lines.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +412,6 @@ model = "gpt-5.1-codex"
 name = "any"
 wire_api = "responses"
 "#;
-
         let result = update_codex_toml_field(input, "base_url", "https://example.com/v1").unwrap();
         let parsed: toml::Value = toml::from_str(&result).unwrap();
 
