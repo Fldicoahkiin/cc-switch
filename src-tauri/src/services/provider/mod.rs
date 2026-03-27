@@ -512,6 +512,20 @@ impl ProviderService {
 
             // Note: No Live config write, no MCP sync
             // The proxy server will route requests to the new provider via is_current
+
+            // Codex 特殊处理：代理接管模式下同样需要同步历史元数据
+            if matches!(app_type, AppType::Codex) {
+                if let Err(e) = sync_codex_rollout_model_provider(id) {
+                    log::warn!("[hot-switch] 同步 Codex rollout model_provider 失败: {e}");
+                }
+                if let Err(e) = sync_codex_threads_model_provider(id) {
+                    log::warn!("[hot-switch] 同步 Codex threads.model_provider 失败: {e}");
+                }
+                if let Err(e) = rebuild_codex_session_index() {
+                    log::warn!("[hot-switch] 重建 Codex session_index.jsonl 失败: {e}");
+                }
+            }
+
             return Ok(SwitchResult::default());
         }
 
