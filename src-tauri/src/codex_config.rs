@@ -1,6 +1,7 @@
 // unused imports removed
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::{
     atomic_write, delete_file, get_home_dir, sanitize_provider_name, write_json_file,
@@ -282,6 +283,9 @@ fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), Ap
 }
 
 /// 统一 Codex 历史 rollout 首行里的 model_provider 到当前活动 provider
+///
+/// 注意：此函数在 Codex 运行时执行可能存在竞态条件（读-改-写整文件），
+/// 建议仅在 Codex 未运行时调用，或配合文件锁使用
 pub fn sync_codex_rollout_model_provider(provider_id: &str) -> Result<usize, AppError> {
     let root = get_codex_config_dir();
     let mut files = Vec::new();
@@ -335,7 +339,8 @@ pub fn sync_codex_rollout_model_provider(provider_id: &str) -> Result<usize, App
     Ok(changed)
 }
 
-/// 将 Codex state_5.sqlite 中的 threads.model_provider 统一到当前活动 provider
+/// 将 Codex state_5.sqlite 中的 threads.model_provider 修复为当前活动 provider
+/// 只修复缺失值（NULL），不覆盖已有值，避免污染跨 provider 的历史数据
 pub fn sync_codex_threads_model_provider(provider_id: &str) -> Result<usize, AppError> {
     let path = get_codex_state_db_path();
     if !path.exists() {
@@ -343,9 +348,13 @@ pub fn sync_codex_threads_model_provider(provider_id: &str) -> Result<usize, App
     }
 
     let conn = Connection::open(&path).map_err(|e| AppError::Database(e.to_string()))?;
+    // 设置 busy timeout 避免 SQLITE_BUSY 错误
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    // 只修复缺失值，不覆盖已有 provider 的历史记录
     let changed = conn
         .execute(
-            "UPDATE threads SET model_provider = ?1 WHERE model_provider IS NULL OR model_provider != ?1",
+            "UPDATE threads SET model_provider = ?1 WHERE model_provider IS NULL",
             [provider_id],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -353,6 +362,7 @@ pub fn sync_codex_threads_model_provider(provider_id: &str) -> Result<usize, App
 }
 
 /// 从 state_5.sqlite 的 threads 表重建 session_index.jsonl
+/// 注意：此函数假设 session_index 是 threads 的全量镜像，如有筛选逻辑需调整
 pub fn rebuild_codex_session_index() -> Result<usize, AppError> {
     let db_path = get_codex_state_db_path();
     if !db_path.exists() {
@@ -360,6 +370,9 @@ pub fn rebuild_codex_session_index() -> Result<usize, AppError> {
     }
 
     let conn = Connection::open(&db_path).map_err(|e| AppError::Database(e.to_string()))?;
+    // 设置 busy timeout 避免 SQLITE_BUSY 错误
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| AppError::Database(e.to_string()))?;
     let mut stmt = conn
         .prepare(
             "SELECT id, COALESCE(title, first_user_message, 'New Session') AS thread_name, \
