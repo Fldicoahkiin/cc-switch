@@ -13,10 +13,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app_config::AppType;
-use crate::codex_config::{
-    rebuild_codex_session_index, sync_codex_rollout_model_provider,
-    sync_codex_threads_model_provider,
-};
 use crate::error::AppError;
 use crate::provider::{Provider, UsageResult};
 use crate::services::mcp::McpService;
@@ -513,19 +509,6 @@ impl ProviderService {
             // Note: No Live config write, no MCP sync
             // The proxy server will route requests to the new provider via is_current
 
-            // Codex 特殊处理：代理接管模式下同样需要同步历史元数据
-            if matches!(app_type, AppType::Codex) {
-                if let Err(e) = sync_codex_rollout_model_provider(id) {
-                    log::warn!("[hot-switch] 同步 Codex rollout model_provider 失败: {e}");
-                }
-                if let Err(e) = sync_codex_threads_model_provider(id) {
-                    log::warn!("[hot-switch] 同步 Codex threads.model_provider 失败: {e}");
-                }
-                if let Err(e) = rebuild_codex_session_index() {
-                    log::warn!("[hot-switch] 重建 Codex session_index.jsonl 失败: {e}");
-                }
-            }
-
             return Ok(SwitchResult::default());
         }
 
@@ -615,29 +598,6 @@ impl ProviderService {
 
         // Sync to live (write_gemini_live handles security flag internally for Gemini)
         write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
-
-        // Codex 特殊处理：切换 live 配置后，同步历史 rollout 首行中的 model_provider，
-        // 并重建 session_index，避免 thread/list 因历史元数据与当前 provider 不一致而过滤空历史。
-        if matches!(app_type, AppType::Codex) {
-            if let Err(e) = sync_codex_rollout_model_provider(id) {
-                log::warn!("同步 Codex rollout model_provider 失败: {e}");
-                result
-                    .warnings
-                    .push("codex_rollout_sync_failed".to_string());
-            }
-            if let Err(e) = sync_codex_threads_model_provider(id) {
-                log::warn!("同步 Codex threads.model_provider 失败: {e}");
-                result
-                    .warnings
-                    .push("codex_threads_sync_failed".to_string());
-            }
-            if let Err(e) = rebuild_codex_session_index() {
-                log::warn!("重建 Codex session_index.jsonl 失败: {e}");
-                result
-                    .warnings
-                    .push("codex_session_index_rebuild_failed".to_string());
-            }
-        }
 
         // Sync MCP
         McpService::sync_all_enabled(state)?;
